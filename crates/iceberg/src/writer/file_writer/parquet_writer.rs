@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -307,6 +308,12 @@ impl MinMaxColAggregator {
 }
 
 impl ParquetWriter {
+    /// Bound on in-flight Parquet footer reads inside
+    /// [`Self::parquet_files_to_data_files`]. Chosen to match typical
+    /// S3 client connection-pool sizes. Expose as a parameter in a
+    /// future change if callers need to tune this.
+    const ADD_FILES_CONCURRENCY: usize = 32;
+
     /// Convert a list of existing Parquet file paths into [`DataFile`]
     /// records that can be fed to
     /// [`FastAppendAction::add_data_files`](crate::transaction::FastAppendAction::add_data_files)
@@ -320,46 +327,54 @@ impl ParquetWriter {
     /// files). The caller is responsible for ensuring the Parquet schema
     /// matches the target table's current schema (field ids must be
     /// embedded as Parquet field metadata).
+    ///
+    /// Up to [`Self::ADD_FILES_CONCURRENCY`] footers are read in parallel;
+    /// the result order is unspecified.
     pub async fn parquet_files_to_data_files(
         file_io: &FileIO,
         file_paths: Vec<String>,
         table_metadata: &TableMetadata,
     ) -> Result<Vec<DataFile>> {
         let partition_spec = table_metadata.default_partition_spec();
-        let mut data_files: Vec<DataFile> = Vec::new();
+        let schema = table_metadata.current_schema().clone();
 
-        for file_path in file_paths {
-            let input_file = file_io.new_input(&file_path)?;
-            let file_metadata = input_file.metadata().await?;
-            let file_size_in_bytes = file_metadata.size as usize;
-            let reader = input_file.reader().await?;
+        futures::stream::iter(file_paths.into_iter().map(|file_path| {
+            let schema = schema.clone();
+            async move {
+                let input_file = file_io.new_input(&file_path)?;
+                let file_metadata = input_file.metadata().await?;
+                let file_size_in_bytes = file_metadata.size as usize;
+                let reader = input_file.reader().await?;
 
-            let mut parquet_reader = ArrowFileReader::new(file_metadata, reader);
-            let parquet_metadata = parquet_reader.get_metadata(None).await.map_err(|err| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Error reading Parquet metadata: {err}"),
-                )
-            })?;
-            let builder = ParquetWriter::parquet_to_data_file_builder(
-                table_metadata.current_schema().clone(),
-                parquet_metadata,
-                file_size_in_bytes,
-                file_path,
-                // TODO: Implement nan_value_counts here
-                HashMap::new(),
-                Some(partition_spec),
-            )?;
-            // A build failure here means a required DataFile field was
-            // never set by `parquet_to_data_file_builder` — i.e. a
-            // programmer bug, not bad input data.
-            let data_file = builder.build().map_err(|err| {
-                Error::new(ErrorKind::Unexpected, "failed to build DataFile").with_source(err)
-            })?;
-            data_files.push(data_file);
-        }
+                let mut parquet_reader = ArrowFileReader::new(file_metadata, reader);
+                let parquet_metadata =
+                    parquet_reader.get_metadata(None).await.map_err(|err| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Error reading Parquet metadata: {err}"),
+                        )
+                    })?;
 
-        Ok(data_files)
+                let builder = ParquetWriter::parquet_to_data_file_builder(
+                    schema,
+                    parquet_metadata,
+                    file_size_in_bytes,
+                    file_path,
+                    // TODO: Implement nan_value_counts here
+                    HashMap::new(),
+                    Some(partition_spec),
+                )?;
+                // A build failure here means a required DataFile field was
+                // never set by `parquet_to_data_file_builder` — i.e. a
+                // programmer bug, not bad input data.
+                builder.build().map_err(|err| {
+                    Error::new(ErrorKind::Unexpected, "failed to build DataFile").with_source(err)
+                })
+            }
+        }))
+        .buffer_unordered(Self::ADD_FILES_CONCURRENCY)
+        .try_collect()
+        .await
     }
 
     /// `ParquetMetadata` to data file builder.
