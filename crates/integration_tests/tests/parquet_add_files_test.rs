@@ -27,16 +27,17 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field};
 use common::random_ns;
-use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{
+    DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
+    UnboundPartitionField,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
-use iceberg::writer::file_writer::{
-    FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder,
-};
-use iceberg::{Catalog, CatalogBuilder, TableCreation};
+use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, TableCreation};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_integration_tests::get_test_fixture;
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -59,14 +60,43 @@ async fn rest_catalog() -> impl Catalog {
 }
 
 /// Single-column `id: long` schema — simplest shape that still exercises
-/// per-column stats propagation (value_counts, null_value_counts,
-/// lower_bounds, upper_bounds).
+/// partition-on-source-column inference.
 fn id_long_schema() -> Schema {
     Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
         ])
+        .build()
+        .unwrap()
+}
+
+fn identity_on_id_spec(schema: &Schema) -> PartitionSpec {
+    PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_unbound_fields(vec![
+            UnboundPartitionField::builder()
+                .source_id(1)
+                .name("id".to_string())
+                .transform(Transform::Identity)
+                .build(),
+        ])
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+fn bucket_on_id_spec(schema: &Schema) -> PartitionSpec {
+    PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_unbound_fields(vec![
+            UnboundPartitionField::builder()
+                .source_id(1)
+                .name("id_bucket".to_string())
+                .transform(Transform::Bucket(16))
+                .build(),
+        ])
+        .unwrap()
         .build()
         .unwrap()
 }
@@ -146,17 +176,126 @@ async fn test_parquet_files_to_data_files_unpartitioned_happy() {
     let updated = commit_fast_append(&catalog, &table, vec![p1, p2]).await;
     let snap = updated.metadata().current_snapshot().unwrap();
     assert_eq!(
-        snap.summary()
-            .additional_properties
-            .get("total-records")
-            .map(String::as_str),
+        snap.summary().additional_properties.get("total-records").map(String::as_str),
         Some("32"),
     );
     assert_eq!(
-        snap.summary()
-            .additional_properties
-            .get("added-data-files")
-            .map(String::as_str),
+        snap.summary().additional_properties.get("added-data-files").map(String::as_str),
         Some("2"),
     );
+}
+
+#[tokio::test]
+async fn test_parquet_files_to_data_files_identity_partition_happy() {
+    let catalog = rest_catalog().await;
+    let ns = random_ns().await;
+    let schema = id_long_schema();
+
+    let table = catalog
+        .create_table(
+            ns.name(),
+            TableCreation::builder()
+                .name("t_identity".to_string())
+                .schema(schema.clone())
+                .partition_spec(identity_on_id_spec(&schema))
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    // Two single-partition files: all rows in each have the same `id`.
+    let p1 = write_id_parquet(&table, vec![42; 10], "p42").await;
+    let p2 = write_id_parquet(&table, vec![99; 10], "p99").await;
+
+    let updated = commit_fast_append(&catalog, &table, vec![p1, p2]).await;
+
+    // The two DataFiles should land in distinct partitions.
+    let manifest_list = updated
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .load_manifest_list(updated.file_io(), updated.metadata())
+        .await
+        .unwrap();
+
+    let mut partitions = vec![];
+    for entry in manifest_list.entries() {
+        let manifest = entry.load_manifest(updated.file_io()).await.unwrap();
+        for me in manifest.entries() {
+            partitions.push(me.data_file().partition().clone());
+        }
+    }
+    assert_eq!(partitions.len(), 2);
+    // Two distinct partitions recovered from column bounds.
+    let unique: std::collections::HashSet<_> = partitions.into_iter().collect();
+    assert_eq!(unique.len(), 2);
+}
+
+#[tokio::test]
+async fn test_parquet_files_to_data_files_cross_partition_rejects() {
+    let catalog = rest_catalog().await;
+    let ns = random_ns().await;
+    let schema = id_long_schema();
+
+    let table = catalog
+        .create_table(
+            ns.name(),
+            TableCreation::builder()
+                .name("t_cross".to_string())
+                .schema(schema.clone())
+                .partition_spec(identity_on_id_spec(&schema))
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    // File containing two distinct id values under an identity partition:
+    // its rows span two partitions, which add_files must refuse.
+    let bad = write_id_parquet(&table, vec![1, 1, 2, 2], "mixed").await;
+
+    let err = ParquetWriter::parquet_files_to_data_files(
+        table.file_io(),
+        vec![bad],
+        table.metadata(),
+    )
+    .await
+    .expect_err("cross-partition file must error");
+
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message().contains("more than one partition values"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn test_parquet_files_to_data_files_bucket_transform_unsupported() {
+    let catalog = rest_catalog().await;
+    let ns = random_ns().await;
+    let schema = id_long_schema();
+
+    let table = catalog
+        .create_table(
+            ns.name(),
+            TableCreation::builder()
+                .name("t_bucket".to_string())
+                .schema(schema.clone())
+                .partition_spec(bucket_on_id_spec(&schema))
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let p = write_id_parquet(&table, vec![7; 8], "b").await;
+
+    let err = ParquetWriter::parquet_files_to_data_files(
+        table.file_io(),
+        vec![p],
+        table.metadata(),
+    )
+    .await
+    .expect_err("bucket transform must error");
+
+    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
 }
