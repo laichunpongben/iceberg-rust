@@ -307,14 +307,32 @@ impl MinMaxColAggregator {
 }
 
 impl ParquetWriter {
-    /// Converts parquet files to data files
-    #[allow(dead_code)]
-    pub(crate) async fn parquet_files_to_data_files(
+    /// Convert a list of existing Parquet file paths into [`DataFile`]
+    /// records that can be fed to
+    /// [`FastAppendAction::add_data_files`](crate::transaction::FastAppendAction::add_data_files)
+    /// to register the files with an Iceberg table without rewriting data.
+    ///
+    /// Each file's Parquet footer is read to extract row counts, column
+    /// sizes, null counts, and lower / upper bounds. The caller is
+    /// responsible for ensuring the Parquet schema matches the target
+    /// table's current schema (field ids must be embedded as Parquet
+    /// field metadata).
+    ///
+    /// Only unpartitioned tables are supported here; partitioned tables
+    /// return [`ErrorKind::FeatureUnsupported`] and are handled in a
+    /// follow-up change.
+    pub async fn parquet_files_to_data_files(
         file_io: &FileIO,
         file_paths: Vec<String>,
         table_metadata: &TableMetadata,
     ) -> Result<Vec<DataFile>> {
-        // TODO: support adding to partitioned table
+        if !table_metadata.default_partition_spec().is_unpartitioned() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "parquet_files_to_data_files currently only supports unpartitioned tables",
+            ));
+        }
+
         let mut data_files: Vec<DataFile> = Vec::new();
 
         for file_path in file_paths {
@@ -339,7 +357,12 @@ impl ParquetWriter {
                 HashMap::new(),
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
-            let data_file = builder.build().unwrap();
+            // A build failure here means a required DataFile field was
+            // never set by `parquet_to_data_file_builder` — i.e. a
+            // programmer bug, not bad input data.
+            let data_file = builder.build().map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "failed to build DataFile").with_source(err)
+            })?;
             data_files.push(data_file);
         }
 
@@ -2278,5 +2301,133 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    /// Build a minimal unpartitioned / partitioned [`TableMetadata`] for the
+    /// round-trip tests below.
+    fn test_table_metadata(
+        schema: SchemaRef,
+        partition_spec: PartitionSpec,
+        location: &str,
+    ) -> TableMetadata {
+        TableMetadataBuilder::new(
+            (*schema).clone(),
+            partition_spec,
+            SortOrder::unsorted_order(),
+            location.to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    /// `parquet_files_to_data_files` must refuse partitioned tables until
+    /// partition-value inference is implemented (tracked upstream).
+    #[tokio::test]
+    async fn test_parquet_files_to_data_files_partitioned_rejects() {
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partitioned_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_unbound_fields(vec![
+                UnboundPartitionField::builder()
+                    .source_id(1)
+                    .name("id".to_string())
+                    .transform(Transform::Identity)
+                    .build(),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata = test_table_metadata(iceberg_schema, partitioned_spec, "memory://t");
+
+        let file_io = FileIO::new_with_memory();
+        let err = ParquetWriter::parquet_files_to_data_files(
+            &file_io,
+            vec!["unused/path.parquet".to_string()],
+            &metadata,
+        )
+        .await
+        .expect_err("partitioned table must error");
+
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    /// End-to-end: write a Parquet file, then convert it back into a
+    /// `DataFile` via `parquet_files_to_data_files` against an unpartitioned
+    /// table. Verifies the public API surface works for the simplest case.
+    #[tokio::test]
+    async fn test_parquet_files_to_data_files_roundtrip_unpartitioned() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("roundtrip".to_string(), None, DataFileFormat::Parquet);
+
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "col", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("col", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let col = Arc::new(Int64Array::from_iter_values(0..16)) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![col]).unwrap();
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let file_path = output_file.location().to_string();
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            Arc::new(arrow_schema.as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&batch).await?;
+        let _ = pw.close().await?;
+
+        let table_metadata = test_table_metadata(
+            iceberg_schema,
+            PartitionSpec::unpartition_spec(),
+            temp_dir.path().to_str().unwrap(),
+        );
+
+        let data_files = ParquetWriter::parquet_files_to_data_files(
+            &file_io,
+            vec![file_path.clone()],
+            &table_metadata,
+        )
+        .await?;
+
+        assert_eq!(data_files.len(), 1);
+        let df = &data_files[0];
+        assert_eq!(df.record_count(), 16);
+        assert_eq!(df.file_path(), file_path);
+        assert_eq!(*df.value_counts(), HashMap::from([(1, 16)]));
+        assert_eq!(*df.lower_bounds(), HashMap::from([(1, Datum::long(0))]));
+        assert_eq!(*df.upper_bounds(), HashMap::from([(1, Datum::long(15))]));
+
+        Ok(())
     }
 }
