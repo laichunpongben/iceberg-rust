@@ -1,0 +1,15 @@
+# Fork-only crate. Not intended for upstream — this wraps iceberg-rust
+# with a command-line interface tailored to BHFT's NSE register pipeline.
+[package]
+edition = { workspace = true }
+name = "iceberg-register"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
