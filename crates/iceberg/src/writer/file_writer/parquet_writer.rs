@@ -313,26 +313,19 @@ impl ParquetWriter {
     /// to register the files with an Iceberg table without rewriting data.
     ///
     /// Each file's Parquet footer is read to extract row counts, column
-    /// sizes, null counts, and lower / upper bounds. The caller is
-    /// responsible for ensuring the Parquet schema matches the target
-    /// table's current schema (field ids must be embedded as Parquet
-    /// field metadata).
-    ///
-    /// Only unpartitioned tables are supported here; partitioned tables
-    /// return [`ErrorKind::FeatureUnsupported`] and are handled in a
-    /// follow-up change.
+    /// sizes, null counts, and lower / upper bounds. Partition values are
+    /// inferred from those bounds — see
+    /// [`Self::partition_value_from_bounds`] for the exact algorithm and
+    /// for the two error modes (unsupported transforms, cross-partition
+    /// files). The caller is responsible for ensuring the Parquet schema
+    /// matches the target table's current schema (field ids must be
+    /// embedded as Parquet field metadata).
     pub async fn parquet_files_to_data_files(
         file_io: &FileIO,
         file_paths: Vec<String>,
         table_metadata: &TableMetadata,
     ) -> Result<Vec<DataFile>> {
-        if !table_metadata.default_partition_spec().is_unpartitioned() {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "parquet_files_to_data_files currently only supports unpartitioned tables",
-            ));
-        }
-
+        let partition_spec = table_metadata.default_partition_spec();
         let mut data_files: Vec<DataFile> = Vec::new();
 
         for file_path in file_paths {
@@ -348,15 +341,15 @@ impl ParquetWriter {
                     format!("Error reading Parquet metadata: {err}"),
                 )
             })?;
-            let mut builder = ParquetWriter::parquet_to_data_file_builder(
+            let builder = ParquetWriter::parquet_to_data_file_builder(
                 table_metadata.current_schema().clone(),
                 parquet_metadata,
                 file_size_in_bytes,
                 file_path,
                 // TODO: Implement nan_value_counts here
                 HashMap::new(),
+                Some(partition_spec),
             )?;
-            builder.partition_spec_id(table_metadata.default_partition_spec_id());
             // A build failure here means a required DataFile field was
             // never set by `parquet_to_data_file_builder` — i.e. a
             // programmer bug, not bad input data.
@@ -369,13 +362,23 @@ impl ParquetWriter {
         Ok(data_files)
     }
 
-    /// `ParquetMetadata` to data file builder
+    /// `ParquetMetadata` to data file builder.
+    ///
+    /// When `partition_spec` is `Some`, the partition tuple is inferred
+    /// from column bounds (see [`Self::partition_value_from_bounds`]) and
+    /// applied to the builder along with the spec id. When `None`, the
+    /// builder is returned with `partition = Struct::empty()` and
+    /// `partition_spec_id` unset — the caller is responsible for setting
+    /// both before `.build()`. Writer-side callsites (which don't know the
+    /// spec at close time) use `None`; add-files-style callsites pass the
+    /// table's default spec.
     pub(crate) fn parquet_to_data_file_builder(
         schema: SchemaRef,
         metadata: Arc<ParquetMetaData>,
         written_size: usize,
         file_path: String,
         nan_value_counts: HashMap<i32, u64>,
+        partition_spec: Option<&PartitionSpec>,
     ) -> Result<DataFileBuilder> {
         let index_by_parquet_path = {
             let mut visitor = IndexByParquetPathName::new();
@@ -419,12 +422,17 @@ impl ParquetWriter {
             )
         };
 
+        let partition = match partition_spec {
+            Some(spec) => Self::partition_value_from_bounds(spec, &lower_bounds, &upper_bounds)?,
+            None => Struct::empty(),
+        };
+
         let mut builder = DataFileBuilder::default();
         builder
             .content(DataContentType::Data)
             .file_path(file_path)
             .file_format(DataFileFormat::Parquet)
-            .partition(Struct::empty())
+            .partition(partition)
             .record_count(metadata.file_metadata().num_rows() as u64)
             .file_size_in_bytes(written_size as u64)
             .column_sizes(column_sizes)
@@ -442,56 +450,92 @@ impl ParquetWriter {
                     .filter_map(|group| group.file_offset())
                     .collect(),
             ));
+        if let Some(spec) = partition_spec {
+            builder.partition_spec_id(spec.spec_id());
+        }
 
         Ok(builder)
     }
 
-    #[allow(dead_code)]
+    /// Infer the partition tuple for a data file from its column bounds.
+    ///
+    /// For each field in `partition_spec`, looks up the source column's
+    /// lower and upper bounds (as produced by [`MinMaxColAggregator`]),
+    /// applies the field's [`Transform`] to both ends, and — if the
+    /// transform is order-preserving and both transformed values agree —
+    /// uses that value as the partition value.
+    ///
+    /// Mirrors pyiceberg's `add_files` partition-inference logic. Two
+    /// error modes callers should expect:
+    ///
+    /// - Non-order-preserving transforms (`Bucket`, `Void`, `Unknown`) —
+    ///   returns [`ErrorKind::FeatureUnsupported`] with the offending
+    ///   field and transform. Such transforms are hash-based or lossy,
+    ///   so the partition value cannot be recovered from bounds alone.
+    /// - Files whose rows span multiple partition values after the
+    ///   transform — returns [`ErrorKind::DataInvalid`] with a message
+    ///   identifying the field and the divergent transformed values.
+    ///   Callers must split or reject such files before registering.
+    ///
+    /// A source column absent from stats (e.g., all-null) yields a `None`
+    /// partition value.
+    ///
+    /// Note that the order-of-operations matters: the transform is
+    /// applied to each bound *first*, then the results are compared. This
+    /// is what allows e.g. `month(ts)` to accept a file whose rows span
+    /// Jan 5 through Jan 31 (same month), while still rejecting one that
+    /// spans Jan 31 through Feb 1 (two months).
     fn partition_value_from_bounds(
-        table_spec: Arc<PartitionSpec>,
+        partition_spec: &PartitionSpec,
         lower_bounds: &HashMap<i32, Datum>,
         upper_bounds: &HashMap<i32, Datum>,
     ) -> Result<Struct> {
-        let mut partition_literals: Vec<Option<Literal>> = Vec::new();
+        let mut partition_literals: Vec<Option<Literal>> =
+            Vec::with_capacity(partition_spec.fields().len());
 
-        for field in table_spec.fields() {
-            if let (Some(lower), Some(upper)) = (
+        for field in partition_spec.fields() {
+            let (Some(lower), Some(upper)) = (
                 lower_bounds.get(&field.source_id),
                 upper_bounds.get(&field.source_id),
-            ) {
-                if !field.transform.preserves_order() {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "cannot infer partition value for non linear partition field (needs to preserve order): {} with transform {}",
-                            field.name, field.transform
-                        ),
-                    ));
-                }
-
-                if lower != upper {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "multiple partition values for field {}: lower: {:?}, upper: {:?}",
-                            field.name, lower, upper
-                        ),
-                    ));
-                }
-
-                let transform_fn = create_transform_function(&field.transform)?;
-                let transform_literal =
-                    Literal::from(transform_fn.transform_literal_result(lower)?);
-
-                partition_literals.push(Some(transform_literal));
-            } else {
+            ) else {
+                // Source column absent from stats (e.g., all-null); match
+                // pyiceberg by emitting null here.
                 partition_literals.push(None);
+                continue;
+            };
+
+            if !field.transform.preserves_order() {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Cannot infer partition value from parquet metadata for \
+                         non-order-preserving transform: partition field `{}` uses \
+                         transform `{}`",
+                        field.name, field.transform
+                    ),
+                ));
             }
+
+            let transform_fn = create_transform_function(&field.transform)?;
+            let lower_t = transform_fn.transform_literal(lower)?;
+            let upper_t = transform_fn.transform_literal(upper)?;
+
+            if lower_t != upper_t {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot infer partition value from parquet metadata as there \
+                         are more than one partition values for partition field `{}`: \
+                         lower_value={lower_t:?}, upper_value={upper_t:?}",
+                        field.name
+                    ),
+                ));
+            }
+
+            partition_literals.push(lower_t.map(Literal::from));
         }
 
-        let partition_struct = Struct::from_iter(partition_literals);
-
-        Ok(partition_struct)
+        Ok(Struct::from_iter(partition_literals))
     }
 }
 
@@ -569,6 +613,8 @@ impl FileWriter for ParquetWriter {
                 written_size,
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
+                // Writer-side callers set partition externally after close.
+                None,
             )?])
         }
     }
@@ -2324,45 +2370,6 @@ mod tests {
         .metadata
     }
 
-    /// `parquet_files_to_data_files` must refuse partitioned tables until
-    /// partition-value inference is implemented (tracked upstream).
-    #[tokio::test]
-    async fn test_parquet_files_to_data_files_partitioned_rejects() {
-        let iceberg_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(0)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let partitioned_spec = PartitionSpec::builder(iceberg_schema.clone())
-            .with_spec_id(0)
-            .add_unbound_fields(vec![
-                UnboundPartitionField::builder()
-                    .source_id(1)
-                    .name("id".to_string())
-                    .transform(Transform::Identity)
-                    .build(),
-            ])
-            .unwrap()
-            .build()
-            .unwrap();
-        let metadata = test_table_metadata(iceberg_schema, partitioned_spec, "memory://t");
-
-        let file_io = FileIO::new_with_memory();
-        let err = ParquetWriter::parquet_files_to_data_files(
-            &file_io,
-            vec!["unused/path.parquet".to_string()],
-            &metadata,
-        )
-        .await
-        .expect_err("partitioned table must error");
-
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-    }
-
     /// End-to-end: write a Parquet file, then convert it back into a
     /// `DataFile` via `parquet_files_to_data_files` against an unpartitioned
     /// table. Verifies the public API surface works for the simplest case.
@@ -2428,6 +2435,179 @@ mod tests {
         assert_eq!(*df.lower_bounds(), HashMap::from([(1, Datum::long(0))]));
         assert_eq!(*df.upper_bounds(), HashMap::from([(1, Datum::long(15))]));
 
+        Ok(())
+    }
+
+    /// Write a parquet file containing a single `Int64` column named "id"
+    /// with the given values. Returns the file's absolute path.
+    async fn write_int64_parquet(
+        file_io: &FileIO,
+        temp_dir: &TempDir,
+        label: &str,
+        values: Vec<i64>,
+    ) -> Result<String> {
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let col = Arc::new(Int64Array::from(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![col]).unwrap();
+
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new(label.to_string(), None, DataFileFormat::Parquet);
+        let output_file = file_io
+            .new_output(location_gen.generate_location(None, &file_name_gen.generate_file_name()))?;
+        let file_path = output_file.location().to_string();
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            Arc::new(arrow_schema.as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&batch).await?;
+        let _ = pw.close().await?;
+        Ok(file_path)
+    }
+
+    /// Helper: iceberg schema with a single required `id: long` field (id=1).
+    fn id_long_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Identity-partitioned table + parquet file whose `id` column is constant.
+    /// Partition inference should recover that constant as the partition value.
+    #[tokio::test]
+    async fn test_parquet_files_to_data_files_identity_partition_happy() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let iceberg_schema = id_long_schema();
+
+        let partition_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_unbound_fields(vec![
+                UnboundPartitionField::builder()
+                    .source_id(1)
+                    .name("id".to_string())
+                    .transform(Transform::Identity)
+                    .build(),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let file_path =
+            write_int64_parquet(&file_io, &temp_dir, "identity_happy", vec![42; 8]).await?;
+
+        let metadata = test_table_metadata(
+            iceberg_schema,
+            partition_spec,
+            temp_dir.path().to_str().unwrap(),
+        );
+
+        let data_files =
+            ParquetWriter::parquet_files_to_data_files(&file_io, vec![file_path], &metadata)
+                .await?;
+
+        assert_eq!(data_files.len(), 1);
+        let df = &data_files[0];
+        assert_eq!(
+            *df.partition(),
+            Struct::from_iter(vec![Some(Literal::long(42))])
+        );
+        assert_eq!(df.partition_spec_id, metadata.default_partition_spec_id());
+        Ok(())
+    }
+
+    /// Identity-partitioned table + parquet file whose `id` column holds
+    /// two distinct values. Partition inference must reject the file with
+    /// a `DataInvalid` error citing the divergent bounds — this is the
+    /// same failure mode pyiceberg's `add_files` reports.
+    #[tokio::test]
+    async fn test_parquet_files_to_data_files_cross_partition_rejects() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let iceberg_schema = id_long_schema();
+
+        let partition_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_unbound_fields(vec![
+                UnboundPartitionField::builder()
+                    .source_id(1)
+                    .name("id".to_string())
+                    .transform(Transform::Identity)
+                    .build(),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let file_path =
+            write_int64_parquet(&file_io, &temp_dir, "cross", vec![1, 1, 2, 2]).await?;
+
+        let metadata = test_table_metadata(
+            iceberg_schema,
+            partition_spec,
+            temp_dir.path().to_str().unwrap(),
+        );
+
+        let err = ParquetWriter::parquet_files_to_data_files(&file_io, vec![file_path], &metadata)
+            .await
+            .expect_err("cross-partition file must error");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("more than one partition values"),
+            "unexpected message: {}",
+            err.message()
+        );
+        Ok(())
+    }
+
+    /// Bucket transforms are not order-preserving and cannot be inferred
+    /// from min/max bounds. Should error `FeatureUnsupported`.
+    #[tokio::test]
+    async fn test_parquet_files_to_data_files_bucket_unsupported() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let iceberg_schema = id_long_schema();
+
+        let partition_spec = PartitionSpec::builder(iceberg_schema.clone())
+            .with_spec_id(0)
+            .add_unbound_fields(vec![
+                UnboundPartitionField::builder()
+                    .source_id(1)
+                    .name("id_bucket".to_string())
+                    .transform(Transform::Bucket(16))
+                    .build(),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let file_path = write_int64_parquet(&file_io, &temp_dir, "bucket", vec![7; 4]).await?;
+
+        let metadata = test_table_metadata(
+            iceberg_schema,
+            partition_spec,
+            temp_dir.path().to_str().unwrap(),
+        );
+
+        let err = ParquetWriter::parquet_files_to_data_files(&file_io, vec![file_path], &metadata)
+            .await
+            .expect_err("bucket transform must error");
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
         Ok(())
     }
 }
